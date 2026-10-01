@@ -1,0 +1,36 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Control the approval helper for the current tmux pane.
+usage() {
+    printf '%s\n' 'Usage: yessir [--on | --off | --status | --toggle]' \
+        'Defaults to --toggle. Uses the helper beside this command and the current tmux pane.' \
+        'While Claude is open: tmux prefix, then :run-shell "yessir --on"'
+}
+
+if [ "$#" -gt 1 ]; then
+    usage >&2
+    exit 2
+fi
+
+case "${1:---toggle}" in
+    --on) action=on ;;
+    --off) action=off ;;
+    --status) action=status ;;
+    --toggle) action=toggle ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+script="$0"
+case "$script" in
+    */*) ;;
+    *) script=$(command -v "$script") || exit 1 ;;
+esac
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$script")" && pwd -P) || exit 1
+helper="$script_dir/claude-tmux-yes"
+if [ ! -x "$helper" ]; then
+    printf 'yessir: helper missing or not executable: %s\n' "$helper" >&2
+    exit 1
+fi
+
+exec "$helper" "$action"

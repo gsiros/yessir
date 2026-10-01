@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Toggle Enter-on-approval for one existing Claude Code process in tmux (Linux)."""
+
+import argparse
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+
+OPTION = "@claude_tmux_yes"
+POLL = 0.15
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SELECTED_YES = re.compile(r"^[❯›>]\s*(?:\d+[.)]\s*)?Yes\s*$", re.I)
+NO = re.compile(r"^(?:\d+[.)]\s*)?No(?:\s*$|[, —])", re.I)
+QUESTION = re.compile(
+    r"^Do you want to (?:proceed\?|(?:make this edit to|create|overwrite|"
+    r"write to|edit|insert this cell into|delete this cell from)\b.+\?)$", re.I
+)
+FOOTER = re.compile(r"\besc(?:ape)?\s+to\s+(?:cancel|reject)\b", re.I)
+
+
+def approval_screen(screen):
+    """Recognize a current dialog, with the one-time Yes already focused."""
+    lines = [ANSI.sub("", line).strip().strip("│┃║").strip()
+             for line in screen.splitlines()]
+    # Ignore the outer box, but not a new chat input below an old dialog.
+    while lines and (not lines[-1] or re.fullmatch(r"[─━═╰╯└┘+\- ]+", lines[-1])):
+        lines.pop()
+    if not lines or not FOOTER.search(lines[-1]):
+        return None
+    selected = [i for i, line in enumerate(lines) if SELECTED_YES.fullmatch(line)]
+    if len(selected) != 1:
+        return None
+    i = selected[0]
+    if len(lines) - i > 14 or not any(NO.match(line) for line in lines[i+1:]):
+        return None
+    # The permission question may wrap across terminal rows.
+    before = " ".join(line for line in lines[max(0, i-6):i] if line)
+    has_question = any(QUESTION.fullmatch(before[j:])
+                       for j in range(len(before)) if before.startswith("Do you want to ", j))
+    if not has_question:
+        return None
+    if any("tell Claude what to" in line for line in lines[i+1:]):
+        return None  # A permission comment field is open.
+    return "\n".join(lines)
+
+
+class Tmux:
+    def __init__(self, socket=None):
+        self.base = ["tmux"] + (["-S", socket] if socket else [])
+
+    def run(self, *args, check=True):
+        result = subprocess.run(self.base + list(args), text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=3)
+        if check and result.returncode:
+            raise RuntimeError(result.stderr.strip() or "tmux command failed")
+        return result.stdout.rstrip("\n")
+
+    def info(self, pane):
+        row = self.run("display-message", "-p", "-t", pane,
+                       "#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_in_mode}\t#{pane_dead}")
+        return row.split("\t")
+
+    def token(self, pane):
+        return self.run("show-options", "-p", "-v", "-t", pane, OPTION, check=False)
+
+    def clear(self, pane):
+        self.run("set-option", "-p", "-u", "-t", pane, OPTION, check=False)
+
+    def notify(self, pane, text):
+        print(text, flush=True)
+        self.run("display-message", "-t", pane, text, check=False)
+
+
+def process_stat(pid):
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        fields = raw[raw.rfind(")")+2:].split()
+        # state, pgrp, start time, terminal foreground pgrp, terminal device
+        return fields[0], int(fields[2]), fields[19], int(fields[5]), int(fields[4])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_claude(pid):
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text().strip()
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        first = os.path.basename(os.fsdecode(argv[0])).split(" ")[0]
+        if comm == "claude" or first == "claude":
+            return True
+        exe = os.readlink(f"/proc/{pid}/exe")
+        if "/share/claude/versions/" in exe:
+            return True
+        return first in {"node", "bun"} and any(
+            "/@anthropic-ai/claude-code/" in os.fsdecode(arg) and
+            os.fsdecode(arg).endswith("/cli.js") for arg in argv[1:3])
+    except (OSError, IndexError):
+        return False
+
+
+def owns_foreground(stat, tty):
+    try:
+        # /proc exposes the terminal's foreground group even to a detached watcher.
+        device = os.stat(tty).st_rdev
+        proc_device = stat[4] & 0xffffffff
+        major = (proc_device >> 8) & 0xfff
+        minor = (proc_device & 0xff) | ((proc_device >> 12) & 0xfff00)
+        return stat[1] == stat[3] and device == os.makedev(major, minor)
+    except OSError:
+        return False
+
+
+def find_claude(pane_pid, tty):
+    pending, visited = [int(pane_pid)], set()
+    while pending and len(visited) < 512:
+        pid = pending.pop()
+        if pid in visited:
+            continue
+        visited.add(pid)
+        stat = process_stat(pid)
+        if stat and stat[0] not in {"T", "t", "Z"} and owns_foreground(stat, tty) and is_claude(pid):
+            return pid, stat[2]
+        try:
+            pending.extend(map(int, Path(f"/proc/{pid}/task/{pid}/children").read_text().split()))
+        except OSError:
+            pass
+    return None
+
+
+def foreground_claude(pid, started, tty):
+    stat = process_stat(pid)
+    return bool(stat and stat[2] == started and stat[0] not in {"T", "t", "Z"}
+                and owns_foreground(stat, tty) and is_claude(pid))
+
+
+def watch(tmux, pane, pid, started, token):
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    candidate = sent = None
+    stable_since = 0
+    try:
+        while tmux.token(pane) == token:
+            stat = process_stat(pid)
+            if not stat or stat[2] != started or stat[0] == "Z":
+                break
+            _, _, tty, in_mode, dead = tmux.info(pane)
+            if dead == "1":
+                break
+            if in_mode == "1" or not foreground_claude(pid, started, tty):
+                candidate = None
+                time.sleep(POLL)
+                continue
+            screen = tmux.run("capture-pane", "-p", "-t", pane)
+            prompt = approval_screen(screen)
+            if prompt is None:
+                candidate = sent = None
+            elif prompt != candidate:
+                candidate, stable_since = prompt, time.monotonic()
+            elif prompt != sent and time.monotonic() - stable_since >= 0.3:
+                # Recheck immediately before sending. Never retry a still-visible dialog.
+                fresh = tmux.run("capture-pane", "-p", "-t", pane)
+                info = tmux.info(pane)
+                if (approval_screen(fresh) == prompt and info[3:] == ["0", "0"]
+                        and tmux.token(pane) == token
+                        and foreground_claude(pid, started, info[2])):
+                    tmux.run("send-keys", "-t", pane, "Enter")
+                    sent = prompt
+            time.sleep(POLL)
+    finally:
+        if tmux.token(pane) == token:
+            tmux.clear(pane)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        "While Claude is open: tmux prefix, then :run-shell 'yessir --on'"))
+    parser.add_argument("action", nargs="?", default="toggle",
+                        choices=["toggle", "on", "off", "status", "_watch"])
+    parser.add_argument("--pane", help="tmux pane ID, e.g. %%3 (defaults to this pane)")
+    parser.add_argument("--socket", help="explicit tmux socket path")
+    parser.add_argument("--pid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--started", help=argparse.SUPPRESS)
+    parser.add_argument("--token", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if not sys.platform.startswith("linux"):
+        parser.error("this helper uses Linux /proc to identify the foreground Claude process")
+    if not args.socket and not os.environ.get("TMUX"):
+        parser.error("run inside tmux, or supply --socket and --pane")
+    tmux = Tmux(args.socket)
+    socket = tmux.run("display-message", "-p", "#{socket_path}")
+    tmux = Tmux(socket)
+    pane = args.pane or os.environ.get("TMUX_PANE") or tmux.run("display-message", "-p", "#{pane_id}")
+    if not re.fullmatch(r"%\d+", pane):
+        parser.error("--pane must be a pane ID such as %3")
+    if args.action == "_watch":
+        watch(tmux, pane, args.pid, args.started, args.token)
+        return
+    # Serialize rapid toggle presses for this pane and server.
+    cache = Path.home() / ".cache" / "claude-tmux-yes"
+    cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(f"{socket}:{pane}".encode()).hexdigest()
+    with (cache / f"{key}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        tmux.info(pane)
+        current = tmux.token(pane)
+        if args.action == "status":
+            tmux.notify(pane, f"Claude approval helper: {'ON' if current else 'OFF'} for {pane}")
+            return
+        if args.action == "off" or (args.action == "toggle" and current):
+            tmux.clear(pane)
+            tmux.notify(pane, f"Claude approval helper: OFF for {pane}")
+            return
+        if current:
+            tmux.notify(pane, f"Claude approval helper: already ON for {pane}")
+            return
+        _, pane_pid, tty, _, dead = tmux.info(pane)
+        identity = find_claude(pane_pid, tty)
+        if dead == "1" or identity is None:
+            raise RuntimeError("start an interactive Claude Code session in this pane first")
+        pid, started = identity
+        token = secrets.token_hex(16)
+        tmux.run("set-option", "-p", "-t", pane, OPTION, token)
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_watch",
+                              "--socket", socket, "--pane", pane, "--pid", str(pid),
+                              "--started", started, "--token", token],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        except OSError:
+            tmux.clear(pane)
+            raise
+        tmux.notify(pane, f"Claude approval helper: ON for {pane} (one-time Yes)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f"claude-tmux-yes: {exc}", file=sys.stderr)
+        sys.exit(1)

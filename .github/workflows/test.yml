@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y tmux shellcheck
+      - name: Check shell scripts
+        run: shellcheck install.sh bin/yessir
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
