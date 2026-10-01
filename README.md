@@ -5,10 +5,11 @@ Use it with Claude Code in Manual mode.
 The helper accepts the plain **Yes** option when that option is selected.
 It does not change the permission mode.
 
-**USE AT YOUR OWN RISK.** The helper approves commands and file changes without your review.
-It does not check whether an action is safe.
-An approved action can delete data or cause other damage.
-Read the [disclaimer](#disclaimer) before use.
+> [!WARNING]
+> **USE AT YOUR OWN RISK.** The helper approves commands and file changes without your review.
+> It does not check whether an action is safe.
+> An approved action can delete data or cause other damage.
+> Read the [disclaimer](#disclaimer) before use.
 
 ## Requirements
 
