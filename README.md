@@ -100,7 +100,7 @@ To select the installer version too, replace `main` in the URL with the same ref
 
 1. Open tmux.
 2. Start `claude` in the pane that you want to control.
-3. Start a chat in Manual mode.
+3. Start a chat in Manual mode, or set an existing chat to Manual mode.
 4. Open the tmux command prompt inside the window.
    Hold **Ctrl** and press **b**. Release both keys, then press **:**.
    The command prompt appears at the bottom of the tmux window.
